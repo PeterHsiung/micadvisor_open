@@ -31,7 +31,7 @@ func pushData() {
 
 		DockerData, _ := getDockerData(containerId) //get container inspect
 
-		endpoint := getEndPoint(DockerData) //there is the hosts file path in the inpect of container
+		endpoint := containerId[:12] //there is the hosts file path in the inpect of container
 
 		getCpuNum(DockerData) //we need to give the container CPU ENV
 
