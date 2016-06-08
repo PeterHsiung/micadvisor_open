@@ -2,185 +2,210 @@ package main
 
 import (
 	"fmt"
+	"io/ioutil"
+	"net/http"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/google/cadvisor/client"
+	"github.com/google/cadvisor/info/v1"
 )
 
-var (
-	cpuNum   int64
-	countNum int
-)
+func getTag() string {
+	//FIXMI:some other message for container
+	return ""
+}
 
-func pushData() {
-	cadvisorData, err := getCadvisorData()
+func pushIt(value float64, timestamp, metric, tags, containerId, counterType, endpoint string) error {
+	valueRet := strconv.FormatFloat(value, 'f', -1, 64)
+	postThing := `[{"metric": "` + metric + `", "endpoint": "` + endpoint + `", "timestamp": ` + timestamp + `,"step": ` + "60" + `,"value": ` + valueRet + `,"counterType": "` + counterType + `","tags": "` + tags + `"}]`
+	fmt.Printf("%s: %s \n", metric, postThing)
+	LogRun(postThing)
+	//push data to falcon-agent
+	url := "http://127.0.0.1:1988/v1/push"
+	resp, err := http.Post(url, "application/x-www-form-urlencoded", strings.NewReader(postThing))
 	if err != nil {
-		LogErr(err, "getcadvisorData err")
-		return
+		LogErr(err, "Post err in pushIt")
+		return err
+	}
+	defer resp.Body.Close()
+	_, err1 := ioutil.ReadAll(resp.Body)
+	if err1 != nil {
+		LogErr(err1, "ReadAll err in pushIt")
+		return err1
+	}
+	return nil
+}
+
+func pushData() error {
+
+	var numStats int = 60
+	client, err := client.NewClient("http://localhost:8080/")
+	if err != nil {
+		LogErr(err, "Can not connect the localhost:8080")
+		return err
+	}
+
+	mInfo, err := client.MachineInfo()
+	if err != nil {
+		LogErr(err, "Can not get machine info")
+		return err
+	}
+
+	cpuNum := int(mInfo.NumCores)
+
+	request := v1.ContainerInfoRequest{NumStats: numStats} //get the cadvisor data
+	cAllInfo, err := client.AllDockerContainers(&request)
+
+	if err != nil {
+		fmt.Println(err)
 	}
 
 	t := time.Now().Unix()
 	timestamp := fmt.Sprintf("%d", t)
 
-	cadvDataForOneContainer := strings.Split(cadvisorData, `"aliases":[`)
-	for k := 1; k < len(cadvDataForOneContainer); k++ { //Traversal containers and ignore head
+	for i := 0; i < len(cAllInfo); i++ {
+		var (
+			cpuUsageTotal  uint64
+			cpuUsageUser   uint64
+			cpuUsageSys    uint64
+			memoryUsage    uint64
+			diskIORead     uint64
+			diskIOWrite    uint64
+			networkRxBytes uint64
+			networkTxBytes uint64
+		)
+		cpuUsageTotal = 0
+		cpuUsageUser = 0
+		cpuUsageSys = 0
+		memoryUsage = 0
+		diskIORead = 0
+		diskIOWrite = 0
+		networkRxBytes = 0
+		networkTxBytes = 0
 
-		memLimit := getMemLimit(cadvDataForOneContainer[k]) //cadvisor provide the memlimit
+		cInfo := cAllInfo[i]
 
-		containerId := getContainerId(cadvDataForOneContainer[k]) //cadvisor provide the containerId
+		containerId := cInfo.Id
+		endpoint := cInfo.Id[:12]
+		memoryTotal := cInfo.Spec.Memory.Limit
 
-		DockerData, _ := getDockerData(containerId) //get container inspect
+		tag := getTag()
 
-		endpoint := containerId[:12] //there is the hosts file path in the inpect of container
+		j := len(cInfo.Stats)
+		cpuUsageTotal = cInfo.Stats[j-1].Cpu.Usage.Total - cInfo.Stats[0].Cpu.Usage.Total
+		cpuUsageUser = cInfo.Stats[j-1].Cpu.Usage.User - cInfo.Stats[0].Cpu.Usage.User
+		cpuUsageSys = cInfo.Stats[j-1].Cpu.Usage.System - cInfo.Stats[0].Cpu.Usage.System
+		networkRxBytes = cInfo.Stats[j-1].Network.InterfaceStats.RxBytes - cInfo.Stats[0].Network.InterfaceStats.RxBytes
+		networkTxBytes = cInfo.Stats[j-1].Network.InterfaceStats.TxBytes - cInfo.Stats[0].Network.InterfaceStats.TxBytes
 
-		getCpuNum(DockerData) //we need to give the container CPU ENV
-
-		tag := getTag() //recode some other message for a container
-
-		ausge, busge := getUsageData(cadvDataForOneContainer[k]) //get 2 usage because some metric recoding Incremental metric
-
-		cpuuage1 := getBetween(ausge, `"cpu":`, `,"diskio":`)
-		cpuuage2 := getBetween(busge, `"cpu":`, `,"diskio":`)
-		if err := pushCPU(cpuuage1, cpuuage2, timestamp, tag, containerId, endpoint); err != nil { //get cadvisor data about CPU
-			LogErr(err, "pushCPU err in pushData")
+		for n := 0; n < j; n++ {
+			memoryUsage += cInfo.Stats[n].Memory.Usage
+			for m := 0; m < len(cInfo.Stats[n].DiskIo.IoServiceBytes); m++ {
+				diskIORead += cInfo.Stats[n].DiskIo.IoServiceBytes[m].Stats["Read"]
+				diskIOWrite += cInfo.Stats[n].DiskIo.IoServiceBytes[m].Stats["Write"]
+			}
 		}
 
-		diskiouage := getBetween(ausge, `"diskio":`, `,"memory":`)
-		if err := pushDiskIo(diskiouage, timestamp, tag, containerId, endpoint); err != nil { //get cadvisor data about DISKIO
-			LogErr(err, "pushDiskIo err in pushData")
+		if err := pushCPU(numStats, cpuNum, cpuUsageTotal, cpuUsageUser, cpuUsageSys, timestamp, tag, containerId, endpoint); err != nil {
+			LogErr(err, "pushCPU err")
+			return err
 		}
 
-		memoryuage := getBetween(ausge, `"memory":`, `,"network":`)
-		if err := pushMem(memLimit, memoryuage, timestamp, tag, containerId, endpoint); err != nil { //get cadvisor data about Memery
-			LogErr(err, "pushMem err in pushData")
+		if err := pushMem(numStats, memoryTotal, memoryUsage, timestamp, tag, containerId, endpoint); err != nil {
+			LogErr(err, "pushMem err")
+			return err
 		}
 
-		networkuage1 := getBetween(ausge, `"network":`, `,"task_stats":`)
-		networkuage2 := getBetween(busge, `"network":`, `,"task_stats":`)
-		if err := pushNet(networkuage1, networkuage2, timestamp, tag, containerId, endpoint); err != nil { //get cadvisor data about net
-			LogErr(err, "pushNet err in pushData")
+		if err := pushDiskIO(numStats, diskIORead, diskIOWrite, timestamp, tag, containerId, endpoint); err != nil {
+			LogErr(err, "pushDiskIO err")
+			return err
 		}
-	}
-}
 
-func pushCount(metric, usageA, usageB, start, end string, countNum int, timestamp, tags, containerId, endpoint string, weight float64) error {
-
-	temp1, _ := strconv.ParseInt(getBetween(usageA, start, end), 10, 64)
-	temp2, _ := strconv.ParseInt(getBetween(usageB, start, end), 10, 64)
-	usage := float64(temp2-temp1) / float64(countNum) / weight
-	value := fmt.Sprintf("%f", usage)
-	if err := pushIt(value, timestamp, metric, tags, containerId, "GAUGE", endpoint); err != nil {
-		LogErr(err, "pushIt err in "+metric)
-		return err
-	}
-	return nil
-}
-
-func pushNet(networkuage1, networkuage2, timestamp, tags, containerId, endpoint string) error {
-	LogRun("pushNet")
-
-	if err := pushCount("net.if.in.bytes", networkuage1, networkuage2, `"rx_bytes":`, `,"rx_packets":`, countNum, timestamp, tags, containerId, endpoint, 1); err != nil {
-		return err
-	}
-	if err := pushCount("net.if.in.packets", networkuage1, networkuage2, `"rx_packets":`, `,"rx_errors":`, countNum, timestamp, tags, containerId, endpoint, 1); err != nil {
-		return err
-	}
-	if err := pushCount("net.if.in.errors", networkuage1, networkuage2, `"rx_errors":`, `,"rx_dropped":`, countNum, timestamp, tags, containerId, endpoint, 1); err != nil {
-		return err
-	}
-	if err := pushCount("net.if.in.dropped", networkuage1, networkuage2, `"rx_dropped":`, `,"tx_bytes":`, countNum, timestamp, tags, containerId, endpoint, 1); err != nil {
-		return err
-	}
-	if err := pushCount("net.if.out.bytes", networkuage1, networkuage2, `"tx_bytes":`, `,"tx_packets":`, countNum, timestamp, tags, containerId, endpoint, 1); err != nil {
-		return err
-	}
-	if err := pushCount("net.if.out.packets", networkuage1, networkuage2, `"tx_packets":`, `,"tx_errors":`, countNum, timestamp, tags, containerId, endpoint, 1); err != nil {
-		return err
-	}
-	if err := pushCount("net.if.out.errors", networkuage1, networkuage2, `"tx_errors":`, `,"tx_dropped":`, countNum, timestamp, tags, containerId, endpoint, 1); err != nil {
-		return err
-	}
-	if err := pushCount("net.if.out.dropped", networkuage1, networkuage2, `"tx_dropped":`, `,"tx_bytes":`, countNum, timestamp, tags, containerId, endpoint, 1); err != nil {
-		return err
-	}
-
-	return nil
-}
-
-func pushMem(memLimit, memoryusage, timestamp, tags, containerId, endpoint string) error {
-	LogRun("pushMem")
-	memUsageNum := getBetween(memoryusage, `"usage":`, `,"working_set"`)
-	fenzi, _ := strconv.ParseInt(memUsageNum, 10, 64)
-	fenmu, err := strconv.ParseInt(memLimit, 10, 64)
-	if err == nil {
-		memUsage := float64(fenzi) / float64(fenmu)
-		if err := pushIt(fmt.Sprint(memUsage), timestamp, "mem.memused.percent", tags, containerId, "GAUGE", endpoint); err != nil {
-			LogErr(err, "pushIt err in pushMem")
-		}
-	}
-	if err := pushIt(memUsageNum, timestamp, "mem.memused", tags, containerId, "GAUGE", endpoint); err != nil {
-		LogErr(err, "pushIt err in pushMem")
-	}
-
-	if err := pushIt(fmt.Sprint(fenmu), timestamp, "mem.memtotal", tags, containerId, "GAUGE", endpoint); err != nil {
-		LogErr(err, "pushIt err in pushMem")
-	}
-
-	memHotUsageNum := getBetween(memoryusage, `"working_set":`, `,"container_data"`)
-	fenzi, _ = strconv.ParseInt(memHotUsageNum, 10, 64)
-	memHotUsage := float64(fenzi) / float64(fenmu)
-	if err := pushIt(fmt.Sprint(memHotUsage), timestamp, "mem.memused.hot", tags, containerId, "GAUGE", endpoint); err != nil {
-		LogErr(err, "pushIt err in pushMem")
-	}
-
-	return nil
-}
-
-func pushDiskIo(diskiouage, timestamp, tags, containerId, endpoint string) error {
-	LogRun("pushDiskIo")
-	temp := getBetween(diskiouage, `"io_service_bytes":\[`, `,"io_serviced":`)
-	readUsage := getBetween(temp, `,"Read":`, `,"Sync"`)
-
-	if err := pushIt(readUsage, timestamp, "disk.io.read_bytes", tags, containerId, "COUNTER", endpoint); err != nil {
-		LogErr(err, "pushIt err in pushDiskIo")
-	}
-
-	writeUsage := getBetween(temp, `,"Write":`, `}`)
-
-	if err := pushIt(writeUsage, timestamp, "disk.io.write_bytes", tags, containerId, "COUNTER", endpoint); err != nil {
-		LogErr(err, "pushIt err in pushDiskIo")
-	}
-
-	return nil
-}
-
-func pushCPU(cpuuage1, cpuuage2, timestamp, tags, containerId, endpoint string) error {
-	LogRun("pushCPU")
-	if err := pushCount("cpu.busy", cpuuage1, cpuuage2, `{"total":`, `,"per_cpu_usage":`, countNum, timestamp, tags, containerId, endpoint, 10000000*float64(cpuNum)); err != nil {
-		return err
-	}
-
-	if err := pushCount("cpu.user", cpuuage1, cpuuage2, `"user":`, `,"sy`, countNum, timestamp, tags, containerId, endpoint, 10000000*float64(cpuNum)); err != nil {
-		return err
-	}
-
-	if err := pushCount("cpu.system", cpuuage1, cpuuage2, `"system":`, `},`, countNum, timestamp, tags, containerId, endpoint, 10000000*float64(cpuNum)); err != nil {
-		return err
-	}
-
-	percpu1 := strings.Split(getBetween(cpuuage1, `,"per_cpu_usage":\[`, `\],"user":`), `,`)
-	percpu2 := strings.Split(getBetween(cpuuage2, `,"per_cpu_usage":\[`, `\],"user":`), `,`)
-
-	metric := fmt.Sprintf("cpu.core.busy")
-	for i, _ := range percpu1 {
-		temp1, _ := strconv.ParseInt(percpu1[i], 10, 64)
-		temp2, _ := strconv.ParseInt(percpu2[i], 10, 64)
-		temp3 := temp2 - temp1
-		perCpuUsage := fmt.Sprintf("%f", float64(temp3)/10000000)
-		if err := pushIt(perCpuUsage, timestamp, metric, tags+",core="+fmt.Sprint(i), containerId, "GAUGE", endpoint); err != nil {
-			LogErr(err, "pushIt err in pushCPU")
+		if err := pushNet(numStats, networkRxBytes, networkTxBytes, timestamp, tag, containerId, endpoint); err != nil {
+			LogErr(err, "pushNet err")
 			return err
 		}
 	}
+	return nil
+}
+
+func pushCPU(numStats, cpuNum int, cpuUsageTotal, cpuUsageUser, cpuUsageSys uint64, timestamp, tags, containerId, endpoint string) error {
+	LogRun("pushCPU")
+
+	cpuUsageTotalRet := float64(cpuUsageTotal) / (float64(cpuNum) * 100000000 * float64(numStats)) * 100
+	cpuUsageUserRet := float64(cpuUsageUser) / (float64(cpuNum) * 100000000 * float64(numStats)) * 100
+	cpuUsageSysRet := float64(cpuUsageSys) / (float64(cpuNum) * 100000000 * float64(numStats)) * 100
+
+	if err := pushIt(cpuUsageTotalRet, timestamp, "cpu.busy", tags, containerId, "GAUGE", endpoint); err != nil {
+		LogErr(err, "pushIt err in cpu.busy")
+		return err
+	}
+
+	if err := pushIt(cpuUsageUserRet, timestamp, "cpu.user", tags, containerId, "GAUGE", endpoint); err != nil {
+		LogErr(err, "pushIt err in cpu.user")
+		return err
+	}
+
+	if err := pushIt(cpuUsageSysRet, timestamp, "cpu.system", tags, containerId, "GAUGE", endpoint); err != nil {
+		LogErr(err, "pushIt err in cpu.system")
+		return err
+	}
+
+	return nil
+}
+
+func pushMem(numStats int, memLimit, memoryusage uint64, timestamp, tags, containerId, endpoint string) error {
+	LogRun("pushMem")
+
+	memoryUsageRet := memoryusage / uint64(numStats)
+
+	if err := pushIt(float64(memLimit), timestamp, "mem.memtotal", tags, containerId, "GAUGE", endpoint); err != nil {
+		LogErr(err, "pushIt err in mem.memtotal")
+		return err
+	}
+
+	if err := pushIt(float64(memoryUsageRet), timestamp, "mem.memused", tags, containerId, "GAUGE", endpoint); err != nil {
+		LogErr(err, "pushIt err in mem.memtotal")
+		return err
+	}
+
+	memUsedPercent := float64(memoryUsageRet) / float64(memLimit) * 100
+	if err := pushIt(memUsedPercent, timestamp, "mem.memused.percent", tags, containerId, "GAUGE", endpoint); err != nil {
+		LogErr(err, "pushIt err in mem.memtotal")
+		return err
+	}
+
+	return nil
+}
+
+func pushNet(numStats int, networkRxBytes, networkTxBytes uint64, timestamp, tags, containerId, endpoint string) error {
+	LogRun("pushNet")
+
+	networkRxRet := float64(networkRxBytes) / float64(numStats)
+	if err := pushIt(networkRxRet, timestamp, "net.if.in.bytes", tags, containerId, "GAUGE", endpoint); err != nil {
+		LogErr(err, "pushIt err in net.if.in.bytes")
+		return err
+	}
+	networkTxRet := float64(networkTxBytes) / float64(numStats)
+	if err := pushIt(networkTxRet, timestamp, "net.if.out.bytes", tags, containerId, "GAUGE", endpoint); err != nil {
+		LogErr(err, "pushIt err in net.if.out.bytes")
+		return err
+	}
+	return nil
+}
+
+func pushDiskIO(numStats int, diskIORead, diskIOWrite uint64, timestamp, tags, containerId, endpoint string) error {
+	LogRun("pushDiskIo")
+	diskIOReadRet := float64(diskIORead) / float64(numStats)
+	diskIOWriteRet := float64(diskIOWrite) / float64(numStats)
+	if err := pushIt(diskIOReadRet, timestamp, "disk.io.read_bytes", tags, containerId, "COUNTER", endpoint); err != nil {
+		LogErr(err, "pushIt err in pushDiskIo")
+	}
+	if err := pushIt(diskIOWriteRet, timestamp, "disk.io.write_bytes", tags, containerId, "COUNTER", endpoint); err != nil {
+		LogErr(err, "pushIt err in pushDiskIo")
+	}
+
 	return nil
 }
